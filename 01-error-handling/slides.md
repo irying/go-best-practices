@@ -48,7 +48,7 @@ style: |
 
 1. **错误在下层<span class="good">带上现场</span>，在上层<span class="good">变成日志和响应</span>。**
 2. **下层用 <span class="kbd">%w</span> 包装，中层透传，入口层<span class="good">只打一次日志</span>。**
-3. **对内用 <span class="kbd">errors.Is / As</span>，对外用<span class="good">稳定错误码</span>** —— 字符串匹配是脆弱的。
+3. **对内用 <span class="kbd">errors.Is / As</span>，对外用 <span class="good">proto 定义的错误码</span>** —— 字符串匹配脆弱，Go 常量不跨语言。
 4. **error 管失败，context 管截止** —— 一起用才完整。
 5. **规则越少越能被一致执行** —— 下面一页能记住的，才是真规范。
 
@@ -196,41 +196,119 @@ if errors.As(err, &ve)              { ... }   // 带字段的错误类型
 |---|---|
 | 包装 / 判断 | 标准库 `fmt.Errorf` + `%w` + `errors.Is/As` |
 | 需要堆栈 | `pkg/errors.Wrap` 或自研 |
-| 业务错误码 | 自研 `ecode` 包，映射 HTTP / gRPC status |
+| 业务错误码 | **proto 定义** + 自研 `ecode` 包桥接 HTTP / gRPC |
 | 并发聚合 | `golang.org/x/sync/errgroup`（注意坑，见下页） |
 
 ---
 
-## HOW-2 · 错误码 & 日志
+## HOW-2 · 错误码放哪里？**默认放 proto**
 
-```go
-// ecode/ecode.go —— 最小设计
-type Code struct {
-    Code    int         // 数字码，稳定对外
-    Message string      // 英文，给开发者
-    Details interface{} // 前端提示 / 重试建议
-}
-func (c *Code) Error() string { return c.Message }
+> 错误码是 API 契约，应该放在离契约最近的地方。
 
-// 公共码复用 HTTP 语义
-var (
-    BadRequest   = &Code{400, "bad request",    nil}
-    Unauthorized = &Code{401, "unauthorized",   nil}
-    NotFound     = &Code{404, "not found",      nil}
-)
-// 业务码：命名空间自维护，如 100xxx 用户域 / 200xxx 订单域
-var UserNotFound = &Code{100001, "user not found", nil}
+| 项目形态 | 放哪里 | 为什么 |
+|---|---|---|
+| gRPC / 多语言 / 跨团队 | <span class="good">**proto**</span> | 一次定义，前端 TS / Go / Java 全语言 codegen；enum number 一旦分配<span class="good">永不可改</span>，天然稳定；评审走 PR |
+| HTTP-only + 纯 Go 单体 | Go `const` / `var` | 多一层 codegen 是负担 |
+| **混合（gRPC + HTTP）** | <span class="good">**proto**</span> | HTTP 侧直接 import 生成的 Go 常量 |
+
+**目录结构建议：**
+```
+api/
+├── code/v1/code.proto              # 公共码：所有服务共享
+├── user/v1/
+│   ├── user.proto                  # RPC 方法定义
+│   └── error_reason.proto          # 用户域业务码
+├── order/v1/error_reason.proto     # 订单域业务码
+└── payment/v1/error_reason.proto   # 支付域业务码
 ```
 
-**日志只在入口打一次**（middleware / interceptor / worker 顶层）：
-```go
-log.Ctx(c).WithFields(...).Errorf("%+v", err)   // %+v 打印完整 wrap 链
-```
-<span class="bad">DAO / SDK / 工具库一律不打日志，只返回 error。</span>
+<span class="mute">一个域一份 proto，命名空间隔离，跨域不会撞号。</span>
 
 ---
 
-## HOW-3 · Context 搭档 & errgroup 三个坑
+## HOW-3 · proto 设计 + 号段治理
+
+**公共码**：复用 HTTP 语义（或 `google.rpc.Code`）
+```proto
+// api/code/v1/code.proto
+enum Code {
+  OK = 0;
+  BAD_REQUEST = 400;   UNAUTHORIZED = 401;   FORBIDDEN = 403;
+  NOT_FOUND = 404;     CONFLICT = 409;       TOO_MANY_REQUESTS = 429;
+  INTERNAL = 500;      UNAVAILABLE = 503;
+}
+```
+
+**业务码**：`reason`（机器可读）+ 映射到公共码（Kratos 风格）
+```proto
+// api/user/v1/error_reason.proto
+enum ErrorReason {
+  option (errors.default_code) = 500;
+
+  USER_NOT_FOUND    = 0 [(errors.code) = 404];
+  INVALID_PASSWORD  = 1 [(errors.code) = 400];
+  EMAIL_DUPLICATED  = 2 [(errors.code) = 409];
+  ACCOUNT_LOCKED    = 3 [(errors.code) = 403];
+}
+```
+
+**号段治理三条铁律：**
+1. **一经分配永不复用** —— 业务下线也保留定义，避免历史日志错乱
+2. **废弃用 `// Deprecated:` 注释**，<span class="bad">不删</span>枚举值
+3. **新增走 PR 评审** —— 号段表写进 README，和业务域对齐
+
+---
+
+## HOW-4 · 双协议桥接：一套 ecode，两端落地
+
+```go
+// ecode/error.go —— 统一 error 类型（由 protoc-gen 产出或手写）
+type Error struct {
+    Code    int32              // 对外的 HTTP/gRPC 码（从 proto 读）
+    Reason  string             // 机器可读：如 "USER_NOT_FOUND"
+    Message string             // 人类可读
+    Details []proto.Message    // 富详情：重试时间 / 帮助链接
+}
+func (e *Error) Error() string  { return e.Reason + ": " + e.Message }
+func (e *Error) Is(t error) bool { /* 按 Reason 比较，支持 errors.Is */ }
+```
+
+<div class="two-col">
+
+**gRPC interceptor**
+```go
+func ErrorInterceptor(ctx, req, info, h) (any, error) {
+    resp, err := h(ctx, req)
+    if err != nil {
+        log.Ctx(ctx).Errorf("%+v", err) // 唯一日志
+        return nil, toGRPCStatus(err).Err()
+    }
+    return resp, nil
+}
+```
+
+**HTTP middleware**
+```go
+func ErrorMW() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        c.Next()
+        if e := c.Errors.Last(); e != nil {
+            log.Ctx(c).Errorf("%+v", e.Err) // 唯一日志
+            er := ecode.From(e.Err)
+            c.JSON(int(er.Code), er)
+        }
+    }
+}
+```
+
+</div>
+
+> <span class="good">同一个 `ecode.Error`</span>：gRPC 塞 `status.Details`，HTTP 写 JSON body。
+> 业务代码<span class="good">只抛 `ecode.Error`</span>，不用关心两套协议。
+
+---
+
+## HOW-5 · Context 搭档 & errgroup 三个坑
 
 ```go
 // error 管失败，context 管截止 —— 一起用才完整
@@ -270,6 +348,8 @@ if err := g.Wait(); err != nil { }   // ③ 只返回第一个 error，必要时
 | `_ = doSomething()` 吞 err | 显式处理或至少注释说明 |
 | panic 代替 return err | Go 不是 Java，仅用于真正不可恢复 |
 | 裸 `errors.New` 对外 | 对外一律 `ecode.*` |
+| 错误码写死在 Go `const` 里 | proto 定义，跨语言 codegen |
+| 错误码号段随便选 | 按域分段 + 永不复用 + PR 评审 |
 
 ---
 
@@ -279,7 +359,7 @@ if err := g.Wait(); err != nil { }   // ③ 只返回第一个 error，必要时
 
 1. 错误在下层<span class="good">带上现场</span>，在上层<span class="good">变成日志和响应</span>
 2. <span class="kbd">%w</span> 包装 · 中层透传 · 入口只打一次日志
-3. 对内 <span class="kbd">errors.Is/As</span>，对外 <span class="good">稳定错误码</span>
+3. 对内 <span class="kbd">errors.Is/As</span>，对外 <span class="good">proto 错误码（gRPC + HTTP 共享）</span>
 4. error 管失败，context 管截止
 5. 规则越少，越能被一致执行
 
