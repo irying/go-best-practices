@@ -190,21 +190,149 @@ func Int(key string, val int) Field { return Field{Key: key, Type: Int64Type, In
 
 ## Part 2 · `zap` · 6 个真实痛点(分级)
 
-性能问题 zap 解决得很好。**但日常用起来的痛感,分三档**:
+性能问题 zap 解决得很好。**但日常用起来,痛感分三档**,下页挨个讲场景。
 
-### 共性痛(大部分团队)
-1. **两套 API 撕裂** —— Logger vs Sugared,code style 难统一
+### 共性痛(大部分团队都遇到)
+1. **两套 API 撕裂** —— Logger vs Sugared,team 内 code style 难统一
 
-### 场景痛(有需求才疼)
-2. **error 信息量不足** —— stack / 根因不自动带,想 Handler 层富化要写 Core
-3. **Handler 层富化成本高** —— 写 `zapcore.Core` 三十多行 + `Field.Type` 十几种分支 + `CheckedEntry` 引用计数
-4. **库依赖污染** —— 对写 SDK/基础库的人很疼
+### 场景痛(有特定需求才疼)—— 下三页详讲
+2. **error 日志定位不到现场** —— 凌晨告警不知道是哪个接口触发的
+3. **日志中间件难写** —— 合规要你 3 天内脱敏,怎么办?
+4. **SDK 锁死你的 logger** —— 升级 zap 要 30 个服务一起改
 
-### 习惯痛(换种写法就缓解)
-5. **Context 非一等公民** —— 写个 `L(ctx)` helper 就解决,slog 只是官方化了
+### 习惯痛(换种写法就缓解,不是 zap 的原罪)
+5. **Context 非一等公民** —— 写个 `L(ctx)` helper 就解决
 6. **全局静态字段** —— `zap.ReplaceGlobals(root.With(pod))` 一行,**根本不是痛**
 
-> 转 slog 的真实硬理由:**写库(6 解不了)+ 大量做 Handler 富化(3 的代价差一倍)**。其他都是场景性。
+---
+
+## 场景痛 2 · 凌晨 2 点,你拿到这条日志
+
+```json
+{"level":"error","msg":"request failed",
+ "error":"dial tcp 10.0.1.5:6379: connection refused"}
+```
+
+你第一反应:"哪个接口?哪个用户?哪条 SQL 之前触发的?"
+
+**没有 stack** —— 你不知道这个 redis dial 是从登录、头像加载、还是哪个 cron job 来的。只能:
+- grep "dial tcp" 把可能的调用点一个个看
+- 问 APM 有没有这条 error 的 trace
+- 运气差:跑到本地复现
+
+**有 stack 的情况**:
+```
+error: dial tcp 10.0.1.5:6379: connection refused
+    redis.(*Client).Get          client.go:234
+    user.(*Cache).GetProfile     cache.go:45
+    user.(*Service).Login        service.go:89      ← 一眼看到
+    handler.Login                handler.go:22
+```
+
+**zap 默认不带 stack**(除非 err 来自 pkg/errors)。要么手动 `zap.Stack("stack")`,要么在日志管道上统一加 —— 后者就落到场景痛 3。
+
+---
+
+## 场景痛 3 · 合规 3 天内要求全量脱敏
+
+**真实场景**:合规/安全周一发令:
+
+> 所有日志里的**手机号、身份证、银行卡、token 必须脱敏**。下周一线上全覆盖,不然业务暂停上线。
+
+业务代码里 `phone` 字段有 200+ 处。**没有日志管道中间件,你只有两条路**:
+
+<div class="two-col">
+
+### zap 方案 A · 扫 200 处调用点
+```go
+// 原来
+logger.Info("send sms",
+    zap.String("phone", user.Phone))
+
+// 改成
+logger.Info("send sms",
+    zap.String("phone", mask(user.Phone)))
+```
+- 两周工作量
+- 漏一个 = 合规事故
+- 新人入职没改 = 事故重演
+
+### zap 方案 B · 写 zapcore.Core
+```go
+type RedactCore struct{ zapcore.Core }
+func (c *RedactCore) Write(ent, fields) error {
+  for i := range fields {
+    if sensitive[fields[i].Key] {
+      switch fields[i].Type {    // 十几种
+      case zapcore.StringType:   ...
+      case zapcore.Int64Type:    ...
+      case zapcore.ReflectType:  ...
+      // 漏一个就放过
+      }
+    }
+  }
+}
+// + Check (CheckedEntry 引用计数)
+// + With + Sync
+```
+30+ 行,新手容易写错。
+
+</div>
+
+### slog 方案 · 10 行"日志中间件"全局生效
+```go
+var sensitive = map[string]bool{"phone":true, "id_card":true, "token":true}
+type RedactHandler struct{ slog.Handler }
+func (h *RedactHandler) Handle(ctx context.Context, r slog.Record) error {
+    nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+    r.Attrs(func(a slog.Attr) bool {
+        if sensitive[a.Key] { nr.AddAttrs(slog.String(a.Key, "***")) } else { nr.AddAttrs(a) }
+        return true
+    })
+    return h.Handler.Handle(ctx, nr)
+}
+// 业务代码 0 行改动,部署上去全局生效
+```
+
+> 把 Handler 想成"**日志管道上的中间件**" —— 和 HTTP middleware 是同一个模式。
+
+---
+
+## 场景痛 4 · SDK 绑了 zap,你就动弹不得
+
+**真实场景**:公司内部 `auth-sdk` 做统一鉴权,业务服务都在用它:
+
+```go
+import "internal.company.com/auth-sdk/v1"
+// auth-sdk 的 go.mod 里:
+//   require go.uber.org/zap v1.21.0
+```
+
+有一天你想:
+- **升级 zap 到 v1.27** (新特性 / 修 CVE / 修 race) → sdk 还在 v1.21,你升不了。等 sdk 维护者发新版
+- **换成 zerolog** (性能考虑,极致场景) → sdk 的 `auth.NewWithZap(logger *zap.Logger)` API 打破了,**30 个业务服务联动改**
+- **本地单测 mock 掉日志** → sdk 内部用了全局 `zap.L()`,mock 不干净
+
+**痛感定位**:这个痛**对写公共库的人疼到极点**,对只写业务的人没感觉。
+
+### slog 方案
+
+SDK 签名只依赖标准库:
+```go
+func NewClient(opts ...Option) *Client
+func WithLogger(l *slog.Logger) Option
+```
+
+业务想换底层 logger?
+```go
+// 用 zap 底层
+handler := slogzap.Option{Logger: zapLogger}.NewZapHandler()
+auth := sdk.NewClient(sdk.WithLogger(slog.New(handler)))
+
+// 换 zerolog 底层?换 adapter 就行,SDK 一行不动
+```
+
+**SDK 作者解脱,业务方也不再被迫选边**。这是**标准库身份**带来的解放。
 
 ---
 
@@ -355,56 +483,33 @@ func (h *TraceHandler) Handle(ctx context.Context, r slog.Record) error {
 
 ---
 
-## Part 3 · 场景详讲 2 · error 自动富化
+## Part 3 · 场景详讲 2 · error 日志的 4 条最佳实践
 
-**4 条最佳实践**:
-1. err 作为结构化字段 — zap/slog 都支持 ✅
-2. 保留 wrap 链文本 — zap/slog 都自动 ✅
-3. 带 stack — 要 pkg/errors 或手动 ⚠️
-4. 根因类型可识别 — 要 `errors.Is/As` 后打 label ❌
+| # | 实践 | zap | slog |
+|---|------|-----|------|
+| 1 | **err 作为结构化字段** | ✅ `zap.Error(err)` | ✅ `slog.Any("err", err)` |
+| 2 | **保留 wrap 链文本**(`%w` 链) | ✅ `err.Error()` 自动 | ✅ 自动 |
+| 3 | **带 stack** —— 定位第一现场 | ⚠️ `zap.Stack` 或 pkg/errors | ⚠️ 同上 |
+| 4 | **根因类型可识别** —— 告警 group-by | ❌ 手动 `errors.Is/As` | ❌ 同上 |
 
-前两条两边都免费。**关键差距**:想让 **3、4 在团队统一做**(Handler 层自动富化):
+**BP 1、2 两边都免费**。差距在 **BP 3、4 想不想"在日志管道里统一装"**:
 
-<div class="two-col">
+- 手动加:`zap.Error(err), zap.Stack("stack"), zap.String("err_kind", classify(err))` 每处一遍,新人大概率忘
+- 想**一次部署全局生效**?→ 需要写"日志中间件",回到场景痛 3 的 zap `Core` vs slog `Handler` 对比
 
-**zap** — 写 `zapcore.Core`
+### 和错误处理章节打通
+
 ```go
-type ErrEnrichCore struct{ zapcore.Core }
-func (c *ErrEnrichCore) Write(...) {
-  for _, f := range fields {
-    if f.Type == zapcore.ErrorType {  // ★
-      err := f.Interface.(error)
-      fields = append(fields,
-        zap.String(..._kind, ...),
-        zap.Stack(..._stack),
-      )
-    }
-  }
-  ...
-}
-// + Check / With / Sync 样板
-```
-
-**slog** — 写 `Handler`
-```go
-type ErrEnrichHandler struct{ slog.Handler }
-func (h *ErrEnrichHandler) Handle(ctx, r) error {
-  r.Attrs(func(a slog.Attr) bool {
-    if err, ok := a.Value.Any().(error); ok {
-      r.AddAttrs(
-        slog.String(a.Key+"_kind", ...),
-        slog.String(a.Key+"_stack", ...),
-      )
-    }
-    return true
-  })
-  return h.Handler.Handle(ctx, r)
+func classifyErr(err error) string {
+    var e *ecode.Error
+    if errors.As(err, &e) { return e.Reason }   // "USER_NOT_FOUND"
+    return "internal"
 }
 ```
 
-</div>
+→ **日志 `err_kind`、HTTP/gRPC 响应的 code、告警 dashboard 的 group-by,三处共用一套 `reason`**。这是错误处理规范 + slog 中间件的协同收益。
 
-代码**差一半**,无 Field.Type 十几种分支 / 无 CheckedEntry 引用计数坑。
+<span class="mute">（zap `ErrEnrichCore` 实现细节与场景痛 3 的脱敏 Core 类似，只是把分支换成 `Field.Type == zapcore.ErrorType`。代码差一半，核心是 slog 的 `Handle(ctx, Record)` 接口让拦截和改写更直白。）</span>
 
 ---
 
