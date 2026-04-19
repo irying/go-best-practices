@@ -44,68 +44,94 @@ style: |
 
 ## 核心结论（先讲完，再展开）
 
-> **日志不是"多写几行 fmt.Printf"，而是给未来的自己和下游系统留证据。**
+> **2023 年起，Go 日志终于有了"官方标准"。其他"优势"都是次要的。**
 
-1. **新项目默认 <span class="kbd">log/slog</span>** —— 标准库统一了接口，生态已收敛到它。
-2. **按读者分层**：<span class="good">应用 / 接入 / 审计 / 业务事件</span> 四类，保留期和严格度都不一样。
-3. **只在入口层打应用日志** —— 和错误处理同源：DAO / SDK 不打，入口统一打。
-4. **结构化 + ctx logger + trace_id** —— 能 grep、能关联、能追溯。
+1. **新项目默认 <span class="kbd">log/slog</span>** —— 不是因为它比 zap 好，而是因为它是**标准库**，生态正向它收敛。
+2. **老项目 zap / logrus 用得好不必强换** —— 业务代码抽象到 `*slog.Logger` 接口，给未来留路。
+3. **写公共库/SDK 必须依赖 <span class="kbd">*slog.Logger</span>** —— 不要再把 zap/logrus 传染给调用方。
+4. **按读者分四类日志**：<span class="good">应用 / 接入 / 审计 / 业务事件</span>，保留期和严格度各不同。
 5. **应用只写 stdout，收集交给 agent** —— 不要让 logger 直连远端存储。
 
 <br>
 
-<span class="mute">下面 11 页都是在给这 5 条加注脚。</span>
+<span class="mute">下面 11 页围绕这 5 条展开。尤其第 1、3 条是今天的重点。</span>
 
 ---
 
-## 为什么要专门聊它 · 4 个痛点合在一起
+## 问题定义：2023 年前，Go 日志栈是"分裂"的
+
+**生态层面的四个痛**：
 
 <div class="two-col">
 
-### <span class="bad">① 组件分裂</span>
-`log` / `logrus` / `zap` / `zerolog` / `slog`
-不同项目一套风格，跨项目排障靠硬背字段名
+### <span class="bad">① 组件选型靠赌</span>
+`log` · `logrus` · `zap` · `zerolog`
+四套 API、四份文档，跨项目协作靠经验
 
-### <span class="bad">② 到处都打，重复打</span>
-DAO 打一次、service 打一次、handler 再打一次
-一次错误 N 条日志，磁盘爆炸，关键信息反而被淹没
+### <span class="bad">② 性能又二次分裂</span>
+logrus 慢 10 倍 · zap 两套 API · zerolog 忘 `.Msg()` 静默丢日志
+**没有"又快又标准"的选项**
 
 </div>
 
 <div class="two-col">
 
-### <span class="bad">③ 敏感信息裸奔</span>
-`log.Printf("user=%+v", user)` 把手机号 / 身份证 / token 直接写进去
-合规事故 + 安全审计红灯
+### <span class="bad">③ 库作者的两难</span>
+`import zap` → 绑架所有调用方
+不打日志 → 丢失可观测性
+SDK 升 zap 大版本 → 30 个服务联动
 
-### <span class="bad">④ 关键操作没留痕 + debug 刷屏</span>
-登录、改权限、支付没审计日志 → 真出事查不到
-Prod 忘关 DEBUG → 日志费用翻倍、ES 扛不住
+### <span class="bad">④ 老问题仍在</span>
+重复打 · 敏感裸奔 · DEBUG 刷屏 · 关键操作没留痕
 
 </div>
 
+> **问题 ①②③ 是 Go 官方亲手解决的**。下一页讲官方为什么出手。
+> 问题 ④ 是团队纪律问题，后面 HOW 会讲。
+
 ---
 
-## 本质：Go 日志的十四年演进
+## 本质：Go 官方在 2023 年把 logging 标准化
 
 ```
- 2012  log (stdlib 1.0)        文本 · 无 level · 无结构化 · 全局状态
- 2014  logrus                  第一代 level + structured (Entry-based · 反射慢)
- 2016  zap (Uber)              零分配 · 高性能 · API 稍冗长
- 2017  zerolog                 chained API · 零分配 · JSON-first
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 2023  log/slog (stdlib 1.21)  官方标准化 · Handler 可插拔 · LogValuer 脱敏
- 2024  zap / zerolog 实现 slog.Handler         生态向 slog 收敛
- 2025  Go 1.24 继续打磨 slog                   新项目事实默认
+ 2012  log (stdlib 1.0)        无 level · 无结构化
+ 2014  logrus                  第一代 structured，慢 10 倍
+ 2016  zap (Uber)              零分配，两套 API 的代价
+ 2017  zerolog                 极致零分配，API 陷阱
+ ────── 生态分裂 11 年 ──────
+ 2022.09  Go 团队立项 proposal #56345 (Jonathan Amsterdam)
+ 2023.08  Go 1.21 发布 log/slog
+ 2024+    主流 SDK / 框架 默认接 *slog.Logger
 ```
 
-**slog 的三个设计要点**（为什么它能成为默认）：
+**核心论点**（引自 [proposal #56345](https://github.com/golang/go/issues/56345) 和 [设计文档 #54763](https://github.com/golang/go/discussions/54763)）：
 
-| 要点 | 含义 | 对团队意义 |
-|---|---|---|
-| `Logger` ↔ `Handler` 解耦 | 接口 vs 实现 | 库只依赖 `*slog.Logger`，不绑死后端 |
-| `LogValuer` 接口 | 字段懒求值 | <span class="good">优雅实现脱敏 / 按需渲染</span> |
-| 标准库内置 | 零依赖 | 库作者可以放心写 `slog` |
+> 大意：Go 日志生态是分裂的。库作者要打日志，要么绑一个第三方库（强迫调用方选边），要么只用没有结构化的标准 `log` 包。**这不是一个健康的生态。**
+
+**slog 的解法不是"做又一个日志库"，而是**：
+
+| 做什么 | 怎么做 |
+|---|---|
+| **统一接口** | `Handler` 接口让 zap/zerolog 都能当后端 |
+| **标准库身份** | 库作者依赖 `*slog.Logger` 零依赖 |
+| **性能不妥协** | 接口允许零分配实现（实测和 zap 同量级）|
+| **ctx 一等公民** | `Handle(ctx, Record)` 让动态字段、trace 天然可达 |
+
+---
+
+## 官方把 slog 放进标准库的 4 个公开论据
+
+> 下面引用来自 [proposal #56345](https://github.com/golang/go/issues/56345)、[discussion #54763](https://github.com/golang/go/discussions/54763)、[Go blog](https://go.dev/blog/slog) 以及 [GopherCon 2023 · Jonathan Amsterdam](https://www.youtube.com/watch?v=tC4Jt3i62ns)（大意，非逐字）。
+
+| # | 论据 | 原文大意 |
+|---|------|---------|
+| 1 | **生态分裂 → 库作者被迫选边** | "Library authors wishing to log must either adopt one of these packages (forcing that choice on their users) or use the standard log package, which has no structure." |
+| 2 | **提供"共通接口"而非替代实现** | "A key design principle is a clean separation of the front-end API from the back-end handler." |
+| 3 | **性能不牺牲** | "The design allows for implementations with zero allocations in the common case." |
+| 4 | **Context 一等公民** | `Handle(ctx, Record)` 写进 Handler 接口 —— 这是刻意的 |
+
+> **关键点**：slog 的目标**不是打败 zap**，而是**统一接口、让生态收敛**。
+> zap 作者 Uber 和 slog 作者在设计阶段有过直接讨论，`slog-zap` adapter 就是协作产物。
 
 ---
 
@@ -370,15 +396,19 @@ func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 
 ## 回到开头那 5 条
 
-1. 新项目默认 <span class="kbd">log/slog</span>
-2. 按读者分层：应用 / 接入 / 审计 / 业务事件
-3. 只在入口层打应用日志（和错误处理同源）
-4. 结构化 + ctx logger + trace_id
+1. 新项目默认 <span class="kbd">log/slog</span>（因为**它是标准库**）
+2. 老项目 zap / logrus 用得好不必强换，但业务代码向 <span class="kbd">*slog.Logger</span> 接口靠拢
+3. 写公共库 / SDK **必须**用 slog —— 不绑架调用方
+4. 按读者分四类日志，保留期和严格度各不同
 5. 应用只写 stdout，收集交给 agent
 
 <br>
 
-> **日志不是给现在的你看的，是给未来的你和下游系统留证据。**
+> **slog 的价值不是"更好"，而是"标准"。生态收敛、新人成本低、库作者零纠结 —— 这些 zap 做不到。**
+
+<br>
+
+> 日志不是给现在的你看的，是给未来的你和下游系统留证据。
 
 <br>
 
