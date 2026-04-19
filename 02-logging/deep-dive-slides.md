@@ -188,117 +188,115 @@ func Int(key string, val int) Field { return Field{Key: key, Type: Int64Type, In
 
 ---
 
-## Part 2 · `zap` · 6 个真实痛点(分级)
+## Part 2 · `zap` 的痛点 · 诚实盘点
 
-性能问题 zap 解决得很好。**但日常用起来,痛感分三档**,下页挨个讲场景。
+做过一轮对比后,zap 真正站得住的"痛"其实**只有 1 条半**。很多常被说成"zap 痛"的,其实不是 zap 的问题。
 
-### 共性痛(大部分团队都遇到)
-1. **两套 API 撕裂** —— Logger vs Sugared,team 内 code style 难统一
+### ✅ 真痛 —— 直白、API 层面的根本差距
+**Context 不是一等公民** —— 没有 `InfoContext(ctx, ...)`,业务里到处 `L(ctx).Info(...)`,每家团队一套 helper。
+<span class="mute">→ Part 3 场景详讲 1 展开</span>
 
-### 场景痛(有特定需求才疼)—— 下三页详讲
-2. **error 日志定位不到现场** —— 凌晨告警不知道是哪个接口触发的
-3. **日志中间件难写** —— 合规要你 3 天内脱敏,怎么办?
-4. **SDK 锁死你的 logger** —— 升级 zap 要 30 个服务一起改
+### ⚠️ 真痛但场景窄 —— 只疼写库的少数人
+**SDK 锁死 logger 版本** —— 下页故事。
 
-### 习惯痛(换种写法就缓解,不是 zap 的原罪)
-5. **Context 非一等公民** —— 写个 `L(ctx)` helper 就解决
-6. **全局静态字段** —— `zap.ReplaceGlobals(root.With(pod))` 一行,**根本不是痛**
+### ❌ 常被说成 zap 痛,其实不是
+| 常被说 | 真相 |
+|---|---|
+| 默认不带 stack | 错误处理规范的事,按 01 做就行(下一页) |
+| 全量脱敏要写 Core | sed 200 处或 Core 40 行都行,非质变(再下一页) |
+| 两套 API 撕裂 | 团队定规范就没事 |
+| 全局静态字段要每处 With | `zap.ReplaceGlobals(root.With(...))` 一行,**根本不是痛** |
+
+> **结论**:API 层面 zap 真正跟不上 slog 的只有 ctx 这条。
+> 加上"标准库身份"这条根本性的生态优势,**真正硬的转投理由就 3 条**(本章最后总结)。
 
 ---
 
-## 场景痛 2 · 凌晨 2 点,你拿到这条日志
+## "默认不带 stack" —— 是错误处理规范的事,不是 zap 的锅
 
+### 凌晨 2 点那条日志
 ```json
-{"level":"error","msg":"request failed",
- "error":"dial tcp 10.0.1.5:6379: connection refused"}
+{"error":"dial tcp 10.0.1.5:6379: connection refused"}
+```
+看起来是"zap 不给力,没 stack"。**其实不是**。
+
+### 按 01 错误处理规范做,zap 自动就有 stack
+
+**边界层用 `pkg/errors.Wrap`** —— 第一次和外部交互时捕获 `runtime.Callers`:
+```go
+// DAO 层
+if err := db.QueryContext(ctx, ...); err != nil {
+    return errors.Wrap(err, fmt.Sprintf("dao get user id=%d", id))
+}
 ```
 
-你第一反应:"哪个接口?哪个用户?哪条 SQL 之前触发的?"
-
-**没有 stack** —— 你不知道这个 redis dial 是从登录、头像加载、还是哪个 cron job 来的。只能:
-- grep "dial tcp" 把可能的调用点一个个看
-- 问 APM 有没有这条 error 的 trace
-- 运气差:跑到本地复现
-
-**有 stack 的情况**:
-```
-error: dial tcp 10.0.1.5:6379: connection refused
-    redis.(*Client).Get          client.go:234
-    user.(*Cache).GetProfile     cache.go:45
-    user.(*Service).Login        service.go:89      ← 一眼看到
-    handler.Login                handler.go:22
+**层间用 `fmt.Errorf("%w")` 带参数** —— 上下文链本身就是"人类可读的 stack":
+```go
+return fmt.Errorf("login user id=%d: %w", uid, err)
 ```
 
-**zap 默认不带 stack**(除非 err 来自 pkg/errors)。要么手动 `zap.Stack("stack")`,要么在日志管道上统一加 —— 后者就落到场景痛 3。
+**zap 自动输出 stack**:
+```go
+logger.Error("login fail", zap.Error(err))
+// {
+//   "error":"login user id=123: dao get user id=123: sql: no rows",
+//   "errorVerbose":"...完整堆栈..."   ← ★ zap 识别 pkg/errors 自动加
+// }
+```
+
+### 90% 场景下,wrap 链上下文比 stack 更好用
+
+`"login user id=123: dao get user id=123: sql: no rows"` —— **一眼看出业务流向 + 出错数据**。纯 stack 只有函数名 + 行号,还要去读代码猜。
+
+### 结论
+
+- **错误处理规范做好 → zap 自动 OK**,不是 zap 痛点
+- 规范做不好 → slog 也救不了
+- 这页只为了呼应一个常见误解 —— 不是转投 slog 的理由
+> <span class="mute">联动 01-error-handling 的 "错误在下层带上现场" 原则。</span>
 
 ---
 
-## 场景痛 3 · 合规 3 天内要求全量脱敏
+## "全量脱敏" —— 勉强算痛,非质变
 
-**真实场景**:合规/安全周一发令:
+### 合规 3 天内要你全量脱敏,方案其实都能做
 
-> 所有日志里的**手机号、身份证、银行卡、token 必须脱敏**。下周一线上全覆盖,不然业务暂停上线。
+| 方案 | 代码量 | 一次工作量 |
+|---|---|---|
+| A · `sed` 改 200 处调用点 | 1 个脚本 | 半天 + regression test |
+| B · zap 写 `RedactCore` | 30-40 行 | 半天,要搞 `Field.Type` 分支 |
+| C · slog 写 `RedactHandler` | 10 行 | 一小时 |
 
-业务代码里 `phone` 字段有 200+ 处。**没有日志管道中间件,你只有两条路**:
+**都能做完**。Core 也没那么难,新手半天也能写出来。
 
-<div class="two-col">
+### 真正差距不在代码行数,在**生态可组合性**
 
-### zap 方案 A · 扫 200 处调用点
 ```go
-// 原来
-logger.Info("send sms",
-    zap.String("phone", user.Phone))
-
-// 改成
-logger.Info("send sms",
-    zap.String("phone", mask(user.Phone)))
-```
-- 两周工作量
-- 漏一个 = 合规事故
-- 新人入职没改 = 事故重演
-
-### zap 方案 B · 写 zapcore.Core
-```go
-type RedactCore struct{ zapcore.Core }
-func (c *RedactCore) Write(ent, fields) error {
-  for i := range fields {
-    if sensitive[fields[i].Key] {
-      switch fields[i].Type {    // 十几种
-      case zapcore.StringType:   ...
-      case zapcore.Int64Type:    ...
-      case zapcore.ReflectType:  ...
-      // 漏一个就放过
-      }
-    }
-  }
-}
-// + Check (CheckedEntry 引用计数)
-// + With + Sync
-```
-30+ 行,新手容易写错。
-
-</div>
-
-### slog 方案 · 10 行"日志中间件"全局生效
-```go
-var sensitive = map[string]bool{"phone":true, "id_card":true, "token":true}
-type RedactHandler struct{ slog.Handler }
-func (h *RedactHandler) Handle(ctx context.Context, r slog.Record) error {
-    nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
-    r.Attrs(func(a slog.Attr) bool {
-        if sensitive[a.Key] { nr.AddAttrs(slog.String(a.Key, "***")) } else { nr.AddAttrs(a) }
-        return true
-    })
-    return h.Handler.Handle(ctx, nr)
-}
-// 业务代码 0 行改动,部署上去全局生效
+// slog 的 Handler 天然可以和别的 Handler 叠加
+handler := slogmulti.Fanout(
+    slogmulti.Pipe(
+        &RedactHandler{}, &SamplingHandler{rate: 10},
+    ).Handler(slog.NewJSONHandler(os.Stdout, nil)),
+    slogsentry.Option{}.NewSentryHandler(),
+    slogloki.Option{}.NewLokiHandler(),
+)
+// 脱敏 + 采样 + 多家输出,全用同一个 slog.Handler 接口
 ```
 
-> 把 Handler 想成"**日志管道上的中间件**" —— 和 HTTP middleware 是同一个模式。
+zap 的 Core 也能串,但每家第三方接入方式不统一(Hook / WriteSyncer / 自定义 Core),**组合成本高**。
+
+### 结论
+
+- "写 Core 难" 本身**不是质变**,算不上 zap 的硬痛
+- 真正值得说的是 slog 的 `samber/slog-*` 生态更统一、可组合
+- 但这个优势**只在接多家 / 做多种横切时**才有感
+- 大多数团队:用不上,**不构成转投理由**
 
 ---
 
-## 场景痛 4 · SDK 绑了 zap,你就动弹不得
+## 真痛(场景窄)· SDK 绑了 zap,你就动弹不得
+
+> **这条只对写公共库 / 基础 SDK 的人疼**。只写业务应用的团队,go.mod 里多一条 zap 根本没感觉 —— 跳过也没关系。
 
 **真实场景**:公司内部 `auth-sdk` 做统一鉴权,业务服务都在用它:
 
@@ -430,22 +428,27 @@ type Value struct {
 
 ---
 
-## Part 3 · slog 到底解决了什么 · 8 个场景客观评估
+## Part 3 · slog vs zap 的 8 个场景 · 诚实评分
 
-> 标榜"三要点"太抽象。下面是**团队日常场景**里 slog vs zap 的真实对比:
+> 经过一轮自我攻防,真正站得住的差距**只有 2 条**。其他要么是规范问题,要么是边际优势。
 
-| 场景 | slog 相对 zap | 评分 |
-|------|--------------|------|
-| 1 动态字段(ctx → trace_id) | Handle 拿 ctx,免 middleware + helper | **真实优势** |
-| 2 error 自动富化(stack + kind) | Handler 代码比 Core 短一半,无 Type/CheckedEntry 坑 | **真实优势** |
-| 3 动态 level | zap 甚至更顺手(现成 HTTP handler) | **打平/zap 略强** |
-| 4 敏感字段(LogValuer + ReplaceAttr) | LogValuer 比 zap ObjectMarshaler 轻 | **真实优势** |
-| 5 接 Sentry/Loki/OTel | 生态统一 `slog.Handler`,接多家才有感 | **真实优势(窄)** |
-| 6 单元测试 | Handler 和生产同一接口 | **轻微优势** |
-| 7 库不绑后端 | 标准库零依赖 | **真实优势(对库作者)** |
-| 8 dev vs prod 格式 | API 表面更统一 | **边际优势** |
+| 场景 | 客观评分 |
+|------|---------|
+| **1 ctx 动态字段**(trace_id) | <span class="good">**✅ 真优势**</span> —— API 根本差距,不可回避 |
+| 2 error 富化(stack + kind) | ❌ **不是 zap 痛**,按 01 错误处理规范做就行 |
+| 3 动态 level | 打平(zap 甚至更顺手) |
+| 4 敏感字段脱敏 | ⚠️ **勉强** —— Core 40 行 vs Handler 10 行非质变,差距在生态 |
+| 5 接 Sentry/Loki/OTel | ⚠️ 窄 —— 接多家才有感,多数团队只接一家 |
+| 6 单元测试 | ⚠️ 轻微 —— zaptest/observer 也够用 |
+| **7 库不绑后端** | <span class="good">**✅ 真优势(对库作者)**</span> —— 标准库身份硬核 |
+| 8 dev vs prod 格式 | 边际 —— 两边都能做 |
 
-**真实差距集中在**:动态/ctx 字段、自动富化、多家接入、库层解耦。
+### 关键认识
+
+**API 层面**:只有 **1(ctx)** 是 zap 不能优雅追上的硬伤。
+**生态层面**:**7(库作者解耦)** + **标准库身份** 构成另外两条硬理由。
+
+其他都是锦上添花 —— **有就更好,没有也活**。
 
 ---
 
@@ -540,6 +543,32 @@ func (h *MyHandler) WithGroup(name string) slog.Handler {
 **就这样**。PodHandler / ErrEnrichHandler / recordCapture / 脱敏 —— 都是这个模板的变体,只改 `Handle`。
 
 > 不想自己写?`samber/slog-multi`、`slog-zap`、`slog-sentry`、`slog-loki`、`phsym/console-slog` 已经把 90% 的常用场景包好了。
+
+---
+
+<!-- _class: lead -->
+
+## 真正硬的只有 3 条
+
+### ① 标准库身份(生态层 · 不可替代)
+- 新项目**选型成本 = 0** —— 不用开会比 zap / logrus / zerolog
+- 2024+ 新 SDK / 框架**默认接 `*slog.Logger`**,跟着走就享受红利
+- 新人学一套就够,教程、官博、权威书都以 slog 为例
+- <span class="bad">zap 永远追不上这一条</span>
+
+### ② Context 一等公民(API 层 · 根本差距)
+- `Handle(ctx, Record)` 写进 Handler 接口 —— ctx 天然到达日志管道
+- `slog.InfoContext(ctx, ...)` 是标准库 API —— 不用自己造 `L(ctx)` helper
+- <span class="bad">zap 靠管道配合能做到"一样好",但永远是补丁</span>
+
+### ③ 写公共库 / SDK(硬要求 · 场景窄)
+- 只依赖标准库 = **不绑架调用方**
+- `slog-zap`、`slog-zerolog` 让调用方爱选啥选啥
+- <span class="bad">zap 再快,基础库 import 它 = 所有下游被迫选边</span>
+
+<br>
+
+> 其他所谓"优势" —— **没它们也能活**。诚实面对这点,转投才不是盲目跟风。
 
 ---
 
@@ -647,25 +676,20 @@ slog.SetDefault(slog.New(h))
 
 - **log (2012)**:文本时代终点 —— 没 level、没结构化
 - **logrus (2014)**:structured 开端,`map + reflect` 慢 10 倍
-- **zap (2016)**:零分配达成,代价是两套 API、Handler 富化成本高、库污染 —— **这些只有做公共库 / 写富化才真疼**
+- **zap (2016)**:零分配达成。**API 层面真正跟不上 slog 的只有 ctx 一等公民这一条**;其他常说的痛(stack、脱敏、两套 API)其实不是 zap 的锅
 - **zerolog (2017)**:极致零分配 + 链式 API 陷阱
-- **slog (2023)**:真正价值只有一条 —— **它是标准库**
+- **slog (2023)**:真正硬的只有 3 条 —— **标准库身份 · ctx 一等公民 · 库作者零绑架**
 
-### 反方意见也得认
-
-- 只写业务应用、zap 用得好 → **不必换**
-- 已有 `L(ctx)` helper → slog 的 ctx-first 体感不强
-- 只接一家 · 不做 Handler 富化 → slog 的 Handler 优势用不上
-
-### 所以
+### 所以该不该换
 
 | 情况 | 做什么 |
 |---|---|
-| 新项目从零 | slog(避免选型会议) |
-| 写公共库/SDK | slog(硬要求) |
-| 老项目 zap 用得好 | 不换,业务代码抽象接口 |
+| 新项目从零 | <span class="good">slog</span>(避免选型会议) |
+| 写公共库 / SDK | <span class="good">slog</span>(硬要求) |
+| 老项目 zap 用得好 | **不换**,业务代码慢慢往 `*slog.Logger` 接口靠 |
 | 老项目 logrus | 有性能压力就换,否则可等 |
-| 大量 Handler 富化 | slog Handler 比 zap Core 省一半 |
+
+> **slog 的价值是"标准",不是"更好"**。承认这点,转投才不盲目跟风。
 
 ---
 
